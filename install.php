@@ -150,10 +150,150 @@ function i_form(string $site_name, string $admin_user, string $admin_email, stri
 {
     i_html('安装 bbs1org', '<div class="hero"><h1>安装 bbs1org</h1><p>一页完成初始化，创建管理员、默认版块和首个主题。</p></div><div class="grid"><section class="card"><div class="hd"><h2>安装配置</h2></div><div class="bd"><form class="form" method="post"><input type="hidden" name="step" value="install"><div class="row"><label>站点名称</label><input type="text" name="site_name" value="' . i_h($site_name) . '" placeholder="我的论坛" required></div><div class="row"><label>管理员用户名</label><input type="text" name="admin_username" value="' . i_h($admin_user) . '" placeholder="admin" required></div><div class="row"><label>管理员邮箱</label><input type="email" name="admin_email" value="' . i_h($admin_email) . '" placeholder="name@example.com" required><small>用于找回密码与通知。</small></div><div class="row"><label>管理员密码</label><input type="password" name="admin_password" value="' . i_h($admin_pass) . '" placeholder="请输入密码" required></div><div class="row"><label>确认管理员密码</label><input type="password" name="admin_password2" value="' . i_h($admin_pass) . '" placeholder="再次输入密码" required></div><div class="row"><label>默认版块名称</label><input type="text" name="forum_name" value="' . i_h($default_forum) . '" required></div><div class="row"><label>首个主题标题</label><input type="text" name="topic_title" value="' . i_h($topic_title) . '" required></div><div class="row"><label>首个主题内容</label><textarea name="topic_body" required>' . i_h(i_readme_text()) . '</textarea></div><div class="checks"><label class="check"><input type="checkbox" name="confirm_clean" value="1" required><span>我确认这是全新安装，数据将被清理。</span></label><label class="check"><input type="checkbox" name="confirm_admin" value="1" required><span>我确认需要手工设置第一个管理员密码。</span></label><label class="check"><input type="checkbox" name="confirm_readme" value="1" required><span>我确认将 README 内容作为第一个主题发布。</span></label></div><div class="actions"><button class="btn" type="submit">开始安装</button></div></form></div></section><aside class="card"><div class="hd"><h2>安装说明</h2></div><div class="bd"><ul class="list"><li>会创建默认用户组和默认版块</li><li>第一个管理员将拥有全部权限</li><li>管理员邮箱可用于找回密码</li><li>README 将作为论坛首帖发布</li></ul></div></aside></div>');
 }
+
+/**
+ * 迁移管理：扫描 migrate/ 目录，列出迁移文件并按需执行。
+ * 迁移文件名格式：migrate_YYYY_MM_DD_NN.php
+ * 执行成功后在 data/ 下生成同名 .lock 文件，已存在锁文件的迁移不再重复执行。
+ */
+
+/** 扫描 migrate 目录，返回所有 migrate_*.php 文件（按文件名升序）的 basename 数组。目录不存在返回空数组。 */
+function i_migration_files(): array
+{
+    $dir = __DIR__ . '/migrate';
+    if (!is_dir($dir)) return [];
+    $list = [];
+    foreach ((array)glob($dir . '/migrate_*.php') as $path) {
+        if (is_file($path)) $list[] = basename($path);
+    }
+    sort($list, SORT_STRING);
+    return $list;
+}
+
+/** 对每个迁移文件判断锁状态，返回结构化数组：[['name'=>basename,'locked'=>bool], ...]（按 name 升序）。 */
+function i_migration_pending(): array
+{
+    $out = [];
+    foreach (i_migration_files() as $name) {
+        $out[] = ['name' => $name, 'locked' => is_file(INSTALL_DATA_DIR . '/' . $name . '.lock')];
+    }
+    return $out;
+}
+
+/** 校验迁移文件名白名单并返回其在 migrate 目录内的绝对路径；非法或不在目录内返回 null。 */
+function i_migration_resolve(?string $name): ?string
+{
+    if ($name === null || $name === '') return null;
+    // 仅允许 ^[A-Za-z0-9_\-]+\.php$ 形式的 basename
+    if (!preg_match('/^[A-Za-z0-9_\-]+\.php$/', $name)) return null;
+    $dir = __DIR__ . '/migrate';
+    $path = $dir . '/' . $name;
+    // realpath 双重校验，防止 .. 穿越并确认文件确实位于 migrate 目录内
+    $realDir = realpath($dir);
+    $realPath = realpath($path);
+    if ($realDir === false || $realPath === false) return null;
+    if (dirname($realPath) !== $realDir) return null;
+    return $realPath;
+}
+
+/** 渲染迁移管理页（只读列出）。 */
+function i_migrations_page(): void
+{
+    $rows = i_migration_pending();
+    $total = count($rows);
+    $executed = 0;
+    foreach ($rows as $r) if ($r['locked']) $executed++;
+    $pendingCount = $total - $executed;
+
+    $body = '<div class="hero"><h1>数据库迁移</h1><p>管理 <span class="mono">migrate/</span> 目录下的数据库结构迁移脚本。</p></div>';
+    $body .= '<div class="grid"><section class="card"><div class="hd"><h2>迁移列表</h2></div><div class="bd">';
+    $body .= '<div class="note">迁移文件位于 <span class="mono">migrate/</span> 目录，执行成功后会在 <span class="mono">data/</span> 目录生成同名 <span class="mono">.lock</span> 锁文件；已执行（有锁）的迁移不会重复执行。</div>';
+    $body .= '<div style="height:14px"></div>';
+    $body .= '<div class="kv"><div>迁移总数</div><div class="mono">' . (string)$total . '</div><div>已执行</div><div class="mono">' . (string)$executed . '</div><div>待执行</div><div class="mono">' . (string)$pendingCount . '</div></div>';
+    $body .= '<div style="height:16px"></div>';
+
+    if ($total === 0) {
+        $body .= '<div class="note warn">暂无迁移文件。</div>';
+    } elseif ($pendingCount === 0) {
+        $body .= '<div class="note ok">所有迁移均已执行。</div>';
+    }
+
+    if ($total > 0) {
+        $body .= '<div style="height:14px"></div>';
+        $body .= '<div class="kv" style="grid-template-columns:minmax(0,1fr) auto auto;gap:10px 12px">';
+        foreach ($rows as $r) {
+            $name = $r['name'];
+            if ($r['locked']) {
+                $status = '<span style="color:var(--ok);font-weight:600">已执行</span>';
+                $action = '<span class="mono" style="color:var(--muted)">—</span>';
+            } else {
+                $status = '<span style="color:var(--warn);font-weight:600">待执行</span>';
+                $action = '<a class="btn" style="min-height:30px;padding:0 12px;background:var(--warn)" href="install.php?do=migration_run&amp;file=' . i_h(rawurlencode($name)) . '&amp;confirm=1" onclick="return confirm(\'确定执行该迁移？将直接修改数据库结构。\')">执行</a>';
+            }
+            $body .= '<div class="mono">' . i_h($name) . '</div><div>' . $status . '</div><div>' . $action . '</div>';
+        }
+        $body .= '</div>';
+    }
+
+    $body .= '<div style="height:16px"></div>';
+    $body .= '<div class="actions"><a class="btn alt" href="install.php?do=migrations">刷新</a><a class="btn" href="index.php">返回首页</a></div>';
+    $body .= '</div></section><aside class="card"><div class="hd"><h2>使用说明</h2></div><div class="bd"><ul class="list"><li>迁移文件名格式：<span class="mono">migrate_YYYY_MM_DD_NN.php</span></li><li>迁移会直接修改数据库结构，执行前请先备份 <span class="mono">data/</span> 目录</li><li>每个迁移只能执行一次，执行后生成同名 <span class="mono">.lock</span> 锁文件</li><li>如需重新执行，删除对应的 <span class="mono">.lock</span> 文件</li><li>迁移脚本内直接使用 <span class="mono">$db</span> 变量执行 SQL</li></ul></div></aside></div>';
+
+    i_html('数据库迁移', $body);
+}
+
+/** 执行一个迁移：要求 confirm=1，校验文件白名单，include 后写锁文件；失败回显错误且不写锁。 */
+function i_migration_run(): void
+{
+    $name = isset($_GET['file']) ? (string)$_GET['file'] : '';
+    $path = i_migration_resolve($name);
+    if ($path === null) {
+        i_html('迁移 - 文件无效', '<div class="hero"><h1>迁移文件无效</h1><p>请求的迁移文件不存在或名称非法。</p></div><div class="card"><div class="bd"><div class="note warn">文件名只允许字母、数字、下划线、连字符及 <span class="mono">.php</span> 后缀，且必须位于 <span class="mono">migrate/</span> 目录内。</div><div style="height:14px"></div><div class="actions"><a class="btn" href="install.php?do=migrations">返回迁移列表</a><a class="btn alt" href="index.php">返回首页</a></div></div></div>');
+    }
+
+    // 必须带 confirm=1，否则重定向回列表
+    if (!isset($_GET['confirm']) || (string)$_GET['confirm'] !== '1') {
+        header('Location: install.php?do=migrations');
+        exit;
+    }
+
+    $lockFile = INSTALL_DATA_DIR . '/' . basename($name) . '.lock';
+    if (is_file($lockFile)) {
+        i_html('迁移 - 已执行', '<div class="hero"><h1>迁移已执行</h1><p>该迁移此前已成功执行，对应的锁文件已存在。</p></div><div class="card"><div class="bd"><div class="note ok">文件：<span class="mono">' . i_h(basename($name)) . '</span></div><div style="height:14px"></div><div class="actions"><a class="btn" href="install.php?do=migrations">返回迁移列表</a><a class="btn alt" href="index.php">返回首页</a></div></div></div>');
+    }
+
+    $base = basename($name);
+    try {
+        // 写锁文件前确保 data 目录存在
+        if (!is_dir(INSTALL_DATA_DIR)) mkdir(INSTALL_DATA_DIR, 0755, true);
+        $db = i_db();
+        // 迁移文件内直接使用 $db 变量执行 $db->exec(...)
+        $result = include $path;
+        // include 返回 false 通常意味着加载/语法错误
+        if ($result === false) {
+            throw new RuntimeException('迁移文件 include 返回 false，可能存在语法或加载错误。');
+        }
+        // 成功：写锁文件
+        if (file_put_contents($lockFile, (string)time(), LOCK_EX) === false) {
+            throw new RuntimeException('迁移已执行，但写入锁文件失败：' . $lockFile);
+        }
+        i_html('迁移执行成功', '<div class="hero"><h1>迁移执行成功</h1><p>该迁移已成功应用并写入锁文件。</p></div><div class="card"><div class="bd"><div class="note ok">已执行：<span class="mono">' . i_h($base) . '</span></div><div style="height:14px"></div><div class="actions"><a class="btn" href="install.php?do=migrations">返回迁移列表</a><a class="btn alt" href="index.php">返回首页</a></div></div></div>');
+    } catch (Throwable $e) {
+        // 失败时不写锁文件
+        i_html('迁移执行失败', '<div class="hero"><h1>迁移执行失败</h1><p>迁移未完成，未生成锁文件，可修正后重试。</p></div><div class="card"><div class="bd"><div class="note warn">迁移会直接修改数据库结构，请确认源文件无误后再执行。</div><div style="height:12px"></div><div class="kv"><div>迁移文件</div><div class="mono">' . i_h($base) . '</div><div>错误信息</div><div class="mono" style="color:var(--danger)">' . i_h($e->getMessage()) . '</div></div><div style="height:14px"></div><div class="actions"><a class="btn" href="install.php?do=migrations">返回迁移列表</a><a class="btn alt" href="index.php">返回首页</a></div></div></div>');
+    }
+}
+
+i_check_sqlite_support();
+
+// 迁移管理分发：必须在安装锁检查之前处理并自行 exit，以便站点安装后仍可访问迁移页
+$do = (string)($_GET['do'] ?? '');
+if ($do === 'migration_run') i_migration_run();   // 内部 exit
+if ($do === 'migrations') i_migrations_page();    // 内部 exit
+
 if (is_file(INSTALL_LOCK_FILE)) {
     i_locked();
 }
-i_check_sqlite_support();
 $step = (string)($_POST['step'] ?? '');
 if ($step !== 'install') {
     i_form('我的论坛', 'admin', '', '', '默认版块', '欢迎使用 bbs1org');

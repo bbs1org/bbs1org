@@ -189,6 +189,9 @@ function default_settings(): array
         'captcha_forms' => '',
         'post_interval_seconds' => '5',
         'pinned_topic_ids' => '',
+        'ip_location_enabled' => '0',
+        'ip_location_granularity' => 'province',
+        'ip_location_api_base' => 'http://81.70.36.26:18184',
     ];
 }
 function settings_cache(bool $refresh = false): array
@@ -229,80 +232,82 @@ function clean_highlight_style(string $style): string
     $style = preg_replace('/[^a-zA-Z0-9:#;,.%()_\-\s]/', '', $style) ?? '';
     return trim(substr($style, 0, 160));
 }
-function normalize_ip_candidate(string $value): string
-{
-    $value = trim($value);
-    if ($value === '') return '';
-    $value = trim($value, " \t\n\r\0\x0B\"'");
-    if ($value === '' || in_array(strtolower($value), ['unknown', 'null', 'undefined'], true)) return '';
-    if (stripos($value, 'for=') === 0) $value = substr($value, 4);
-    $value = trim($value, " \t\n\r\0\x0B\"'");
-    if (preg_match('/^\[([^\]]+)\](?::\d+)?$/', $value, $m)) {
-        $value = $m[1];
-    } elseif (preg_match('/^(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?$/', $value, $m)) {
-        $value = $m[1];
-    }
-    if (str_contains($value, '%')) $value = preg_replace('/%.+$/', '', $value) ?? $value;
-    return filter_var($value, FILTER_VALIDATE_IP) ? $value : '';
-}
-function header_ip_candidates(string $value): array
-{
-    $ips = [];
-    foreach (explode(',', $value) as $part) {
-        $ip = normalize_ip_candidate($part);
-        if ($ip !== '') $ips[] = $ip;
-    }
-    return $ips;
-}
-function forwarded_ip_candidates(string $value): array
-{
-    $ips = [];
-    foreach (explode(',', $value) as $entry) {
-        foreach (explode(';', $entry) as $param) {
-            $pair = explode('=', $param, 2);
-            if (count($pair) !== 2 || strtolower(trim($pair[0])) !== 'for') continue;
-            $ip = normalize_ip_candidate($pair[1]);
-            if ($ip !== '') $ips[] = $ip;
-        }
-    }
-    return $ips;
-}
 function ip_addr(): string
 {
-    $headers = [
-        'HTTP_CF_CONNECTING_IP',
-        'HTTP_TRUE_CLIENT_IP',
-        'HTTP_X_REAL_IP',
-        'HTTP_X_CLIENT_IP',
-        'HTTP_X_REMOTE_IP',
-        'HTTP_X_REMOTE_ADDR',
-        'HTTP_X_FORWARDED_FOR',
-        'HTTP_X_FORWARDED_CLIENT_IP',
-        'HTTP_X_ORIGINAL_FORWARDED_FOR',
-        'HTTP_X_FORWARDED',
-        'HTTP_FORWARDED_FOR',
-        'HTTP_FORWARDED',
-        'HTTP_CLIENT_IP',
-        'HTTP_PROXY_CLIENT_IP',
-        'HTTP_WL_PROXY_CLIENT_IP',
-        'HTTP_X_CLUSTER_CLIENT_IP',
-        'HTTP_FASTLY_CLIENT_IP',
-        'HTTP_X_AZURE_CLIENTIP',
-        'HTTP_ALI_CDN_REAL_IP',
-        'HTTP_CDN_CLIENT_IP',
-        'HTTP_CDN_SRC_IP',
-        'HTTP_X_PROXYUSER_IP',
-        'HTTP_X_COMING_FROM',
-        'HTTP_COMING_FROM',
-        'HTTP_X_APPENGINE_USER_IP',
-    ];
-    foreach ($headers as $header) {
-        $value = trim((string)($_SERVER[$header] ?? ''));
-        if ($value === '') continue;
-        $ips = $header === 'HTTP_FORWARDED' ? forwarded_ip_candidates($value) : header_ip_candidates($value);
-        if ($ips) return $ips[0];
+    // 直接使用 $_SERVER 中的客户端 IP，不做任何代理头兼容
+    return (string)($_SERVER['REMOTE_ADDR'] ?? '');
+}
+// ===== IP 归属地辅助函数 =====
+function ip_location_enabled(): bool
+{
+    return setting('ip_location_enabled', '0') === '1';
+}
+function ip_location_ready(): bool
+{
+    // 迁移是否已执行：以 topics.ip_location 列是否存在为标志（同一迁移会同时给 topics/replies/users 加列）。
+    // 未执行迁移时所有 ip_location 列引用都需回避，否则会抛出「列不存在」异常。
+    static $ready = null;
+    if ($ready !== null) return $ready;
+    try {
+        $cols = q("PRAGMA table_info(topics)")->fetchAll(PDO::FETCH_COLUMN, 1);
+        $ready = in_array('ip_location', $cols, true);
+    } catch (Throwable $e) {
+        $ready = false;
     }
-    return normalize_ip_candidate((string)($_SERVER['REMOTE_ADDR'] ?? '')) ?: '0.0.0.0';
+    return $ready;
+}
+function ip_location_granularity(): string
+{
+    $g = setting('ip_location_granularity', 'province');
+    return in_array($g, ['province', 'city', 'area'], true) ? $g : 'province';
+}
+function ip_location_api_base(): string
+{
+    return rtrim(setting('ip_location_api_base', 'http://81.70.36.26:18184'), '/');
+}
+function ip_location_endpoint_path(string $g): string
+{
+    // 返回不含 base、不含 ip 的接口路径
+    if ($g === 'city') return '/api/v1/lookup_simple/city/';
+    if ($g === 'area') return '/api/v1/lookup_simple/area/';
+    return '/api/v1/lookup_simple/';
+}
+function ip_location_normalize_ip(string $ip): string
+{
+    $ip = trim($ip);
+    if ($ip === '' || $ip === '0.0.0.0') return '';
+    return filter_var($ip, FILTER_VALIDATE_IP) ? $ip : '';
+}
+function ip_location_fetch(string $ip, string $granularity): string
+{
+    // 直接用 file_get_contents 获取接口返回结果，不做任何清洗，原样返回；失败返回 ''
+    $ip = ip_location_normalize_ip($ip);
+    if ($ip === '') return '';
+    $g = in_array($granularity, ['province', 'city', 'area'], true) ? $granularity : 'province';
+    $base = ip_location_api_base();
+    if ($base === '') return '';
+    $url = $base . ip_location_endpoint_path($g) . rawurlencode($ip);
+    try {
+        $ctx = stream_context_create(['http' => ['timeout' => 5]]);
+        $raw = @file_get_contents($url, false, $ctx);
+        return $raw === false ? '' : (string)$raw;
+    } catch (Throwable $e) {
+        return '';
+    }
+}
+function ip_location_lookup(string $ip): string
+{
+    // 关键入口：未开启或 ip 非法返回 ''；否则直接请求接口拿原始返回（不缓存）
+    if (!ip_location_enabled()) return '';
+    $ip = ip_location_normalize_ip($ip);
+    if ($ip === '') return '';
+    return ip_location_fetch($ip, ip_location_granularity());
+}
+function ip_location_badge(string $raw): string
+{
+    // 直接展示数据库中存储的原始归属地字符串；为空则返回 ''
+    if ($raw === '' || !ip_location_enabled()) return '';
+    return '<span class="post-ip-location" title="IP归属地">📍' . h($raw) . '</span>';
 }
 function rate_defaults(): array
 {
@@ -438,6 +443,9 @@ function save_settings(): void
         'captcha_charset' => captcha_charset_value((string)($_POST['captcha_charset'] ?? 'alnum')),
         'captcha_forms' => captcha_forms_value($_POST['captcha_forms'] ?? []),
         'post_interval_seconds' => (string)min(3600, max(0, (int)($_POST['post_interval_seconds'] ?? 5))),
+        'ip_location_enabled' => isset($_POST['ip_location_enabled']) ? '1' : '0',
+        'ip_location_granularity' => in_array((string)($_POST['ip_location_granularity'] ?? ''), ['province', 'city', 'area'], true) ? (string)$_POST['ip_location_granularity'] : 'province',
+        'ip_location_api_base' => rtrim(post('ip_location_api_base', 200), '/'),
     ];
     foreach ($values as $name => $value) q("REPLACE INTO settings(name,value) VALUES(?,?)", [$name, $value]);
     settings_cache(true);
@@ -1350,6 +1358,19 @@ function captcha_image_page(): never
     echo '<svg xmlns="http://www.w3.org/2000/svg" width="132" height="42" viewBox="0 0 132 42" role="img" aria-label="验证码"><rect width="132" height="42" rx="5" fill="#f7fbf9"/><path d="M0 32 C24 18 42 48 66 28 S104 17 132 25" fill="none" stroke="#2ecc71" stroke-opacity=".18" stroke-width="10"/>' . $lines . $dots . $text . '</svg>';
     exit;
 }
+function ip_location_test_page(): never
+{
+    // 管理员测试归属地接口：绕过启用开关，直接调用 ip_location_fetch 拿原始文本
+    need_admin();
+    $ip = trim((string)($_GET['ip'] ?? ''));
+    if ($ip === '') $ip = '221.221.52.203';
+    $g = (string)($_GET['granularity'] ?? '');
+    if (!in_array($g, ['province', 'city', 'area'], true)) $g = ip_location_granularity();
+    $raw = ip_location_fetch($ip, $g);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['ok' => 1, 'ip' => $ip, 'granularity' => $g, 'result' => $raw], JSON_UNESCAPED_UNICODE);
+    exit;
+}
 function svg_icon(string $name): string
 {
     $icons = [
@@ -1651,7 +1672,7 @@ function topic_post_row(array $row, string $body, int $time, string $ops = '', s
     $has_title = $title !== '';
     $title_html = $has_title ? '<div class="post-topic-title"><h1 class="post-content-title">' . h($title) . '</h1>' . $stats . '</div>' : '';
     $avatar = avatar_tag((int)$row['user_id'], (string)$row['username'], (string)($row['avatar_style'] ?? ''), '', (string)($row['avatar_seed'] ?? ''));
-    return '<li class="post-item post-entry' . ($has_title ? ' has-title' : '') . ($highlight ? ' post-highlight' : '') . '" id="post-' . (int)($row['id'] ?? 0) . '">' . $title_html . '<div class="post-avatar">' . $avatar . '</div><div class="post-body"><div class="post-head"><a class="post-title post-author" href="' . h(route_url('user', ['id' => (int)$row['user_id']])) . '">' . h($row['username']) . '</a>' . topic_user_group_html($row) . user_state_tag_html($row) . $ops . '</div><div class="post-meta"><span>' . human_time($time) . '</span></div></div><div class="post-content">' . markdown_html($body) . '</div></li>';
+    return '<li class="post-item post-entry' . ($has_title ? ' has-title' : '') . ($highlight ? ' post-highlight' : '') . '" id="post-' . (int)($row['id'] ?? 0) . '">' . $title_html . '<div class="post-avatar">' . $avatar . '</div><div class="post-body"><div class="post-head"><a class="post-title post-author" href="' . h(route_url('user', ['id' => (int)$row['user_id']])) . '">' . h($row['username']) . '</a>' . topic_user_group_html($row) . user_state_tag_html($row) . $ops . '</div><div class="post-meta"><span>' . human_time($time) . '</span>' . ip_location_badge((string)($row['ip_location'] ?? '')) . '</div></div><div class="post-content">' . markdown_html($body) . '</div></li>';
 }
 function quote_reply_action(array $row): string
 {
@@ -1661,7 +1682,10 @@ function quote_reply_action(array $row): string
 function topic_list_select_columns(string $table = 'topics'): string
 {
     $p = $table . '.';
-    return $p . 'id,' . $p . 'title,' . $p . 'highlight_style,' . $p . 'created_at,' . $p . 'updated_at,' . $p . 'reply_count,' . $p . 'last_reply_at,' . $p . 'forum_id,' . $p . 'user_id';
+    $cols = $p . 'id,' . $p . 'title,' . $p . 'highlight_style,' . $p . 'created_at,' . $p . 'updated_at,' . $p . 'reply_count,' . $p . 'last_reply_at,' . $p . 'forum_id,' . $p . 'user_id';
+    // 仅在迁移已执行（列存在）时查询 ip_location，避免升级后未执行迁移导致列表页报错
+    if (ip_location_ready()) $cols .= ',' . $p . 'ip_location';
+    return $cols;
 }
 function topic_list_row(array $t, string $sort): string
 {
@@ -1669,7 +1693,7 @@ function topic_list_row(array $t, string $sort): string
     $forum = $t['forum'] ?? ['id' => (int)$t['forum_id'], 'name' => ''];
     $user_link = '<a href="' . h(route_url('user', ['id' => (int)$t['user_id']])) . '">' . svg_icon('user') . h($t['username']) . '</a>';
     $forum_link = '<a href="' . h(route_url('forum', ['id' => (int)$forum['id']])) . '">' . h($forum['name']) . '</a>';
-    $meta = '<span>' . $user_link . '</span><span class="post-forum-meta">' . svg_icon('forum') . $forum_link . '</span><span>' . svg_icon('reply') . (int)$t['reply_count'] . '</span><span>' . human_time($time) . '</span>';
+    $meta = '<span>' . $user_link . '</span><span class="post-forum-meta">' . svg_icon('forum') . $forum_link . '</span><span>' . svg_icon('reply') . (int)$t['reply_count'] . '</span><span>' . human_time($time) . '</span>' . ip_location_badge((string)($t['ip_location'] ?? ''));
     $pages = topic_page_links((int)$t['id'], (int)$t['reply_count']);
     $reply_id = (int)($t['my_reply_id'] ?? 0);
     $topic_url = route_url('topic', ['id' => (int)$t['id'], 'replyid' => $reply_id > 0 ? $reply_id : null]);
@@ -1693,7 +1717,8 @@ function topic_reply_list_row(array $t): string
     $meta = '<span>' . $user_link . ' 回复了</span>' . $title_link
           . '<span class="post-forum-meta">' . svg_icon('forum') . $forum_link . '</span>'
           . '<span>' . svg_icon('reply') . (int)$t['reply_count'] . '</span>'
-          . '<span>' . human_time((int)$t['last_reply_created_at']) . '</span>';
+          . '<span>' . human_time((int)$t['last_reply_created_at']) . '</span>'
+          . ip_location_badge((string)($t['last_reply_ip_location'] ?? ''));
     $pinned = (int)($t['is_pinned'] ?? 0);
     $badges = $pinned ? '<span class="topic-badge pinned">置顶</span>' : '';
     return '<li class="post-item post-item-reply' . ($pinned ? ' topic-pinned' : '') . '"><a class="row-link" href="' . h($topic_url) . '" aria-hidden="true"></a>'
@@ -2108,7 +2133,12 @@ function save_topic(): int
     $body = (string)$author['body'];
     if ($body === '') err('内容不能为空');
     $ts = now();
-    q("INSERT INTO topics(forum_id,user_id,title,body,created_at,updated_at,last_reply_at) VALUES(?,?,?,?,?,?,?)", [$fid, (int)$author['user_id'], $title, $body, $ts, $ts, $ts]);
+    $topic_ip_location = ip_location_lookup(ip_addr());
+    if (ip_location_ready()) {
+        q("INSERT INTO topics(forum_id,user_id,title,body,created_at,updated_at,last_reply_at,ip_location) VALUES(?,?,?,?,?,?,?,?)", [$fid, (int)$author['user_id'], $title, $body, $ts, $ts, $ts, $topic_ip_location]);
+    } else {
+        q("INSERT INTO topics(forum_id,user_id,title,body,created_at,updated_at,last_reply_at) VALUES(?,?,?,?,?,?,?)", [$fid, (int)$author['user_id'], $title, $body, $ts, $ts, $ts]);
+    }
     $tid = (int)db()->lastInsertId();
     q("UPDATE forums SET last_topic_id=?,last_topic_title=? WHERE id=?", [$tid, $title, $fid]);
     forums_cache(true);
@@ -2167,7 +2197,12 @@ function save_reply(): array
     $body = (string)$author['body'];
     if ($body === '') $ajax ? ajax_error('回复不能为空') : err('回复不能为空');
     $ts = now();
-    q("INSERT INTO replies(topic_id,user_id,body,created_at,updated_at) VALUES(?,?,?,?,?)", [$tid, (int)$author['user_id'], $body, $ts, $ts]);
+    $reply_ip_location = ip_location_lookup(ip_addr());
+    if (ip_location_ready()) {
+        q("INSERT INTO replies(topic_id,user_id,body,created_at,updated_at,ip_location) VALUES(?,?,?,?,?,?)", [$tid, (int)$author['user_id'], $body, $ts, $ts, $reply_ip_location]);
+    } else {
+        q("INSERT INTO replies(topic_id,user_id,body,created_at,updated_at) VALUES(?,?,?,?,?)", [$tid, (int)$author['user_id'], $body, $ts, $ts]);
+    }
     $rid = (int)db()->lastInsertId();
     q("UPDATE topics SET updated_at=?,reply_count=reply_count+1,last_reply_at=? WHERE id=?", [$ts, $ts, $tid]);
     create_reply_notifications($tid, $rid, $body, (int)$author['user_id']);
@@ -2252,6 +2287,14 @@ function login_page(): void
         if ($u && password_verify((string)$_POST['password'], $u['password'])) {
             session_regenerate_id(true);
             $_SESSION['uid'] = (int)$u['id'];
+            // 记录登录 IP 与归属地（迁移已执行时才写入；try/catch 防止归属地接口故障阻断登录）
+            try {
+                if (ip_location_ready()) {
+                    $loc = ip_location_lookup($ip);
+                    q("UPDATE users SET last_login_ip=?, last_login_ip_location=? WHERE id=?", [$ip, $loc, (int)$u['id']]);
+                }
+            } catch (Throwable $e) {
+            }
             go(route_url('home'));
         }
         rate_hit_login_fail($ip);
@@ -2282,12 +2325,15 @@ function profile_page(): void
     need_login();
     $u = me();
     $current_ip = '<label class="grid readonly-grid"><span>当前IP</span><input class="readonly-input" type="text" value="' . h(ip_addr()) . '" disabled readonly></label>';
+    // 最后登录归属地：仅本人可见，归属地功能开启时展示（直接展示原始存储值）
+    $last_login_loc = (string)($u['last_login_ip_location'] ?? '');
+    $last_login_loc_field = (ip_location_enabled() && $last_login_loc !== '') ? '<label class="grid readonly-grid"><span>最后登录归属地</span><input class="readonly-input" type="text" value="' . h($last_login_loc) . '" disabled readonly></label>' : '';
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $_POST['id'] = uid();
         save_user(false);
         go(route_url('profile'));
     }
-    page('个人资料', form_shell('<div class="form-panel"><h2>个人资料</h2><form method="post">' . form_token() . input('用户名', 'username', $u['username'], 'text', true) . input('邮箱', 'email', $u['email'], 'email') . $current_ip . input('新密码', 'password', '', 'password') . input('确认密码', 'password2', '', 'password') . avatar_picker_html($u) . textarea('简介', 'bio', $u['bio']) . '<button>保存</button></form><div class="profile-exit"><a href="' . h(route_url('logout')) . '"><span>安全退出</span><small>退出当前登录状态</small></a></div></div>', $u));
+    page('个人资料', form_shell('<div class="form-panel"><h2>个人资料</h2><form method="post">' . form_token() . input('用户名', 'username', $u['username'], 'text', true) . input('邮箱', 'email', $u['email'], 'email') . $current_ip . $last_login_loc_field . input('新密码', 'password', '', 'password') . input('确认密码', 'password2', '', 'password') . avatar_picker_html($u) . textarea('简介', 'bio', $u['bio']) . '<button>保存</button></form><div class="profile-exit"><a href="' . h(route_url('logout')) . '"><span>安全退出</span><small>退出当前登录状态</small></a></div></div>', $u));
 }
 function user_page(): void
 {
@@ -2427,7 +2473,8 @@ function topic_index_page(?array $filter_forum = null, ?array $filter_user = nul
                 unset($tt);
             }
             $reply_ids = array_values(array_filter(array_map('intval', array_column($rows, 'last_reply_id'))));
-            $reply_map = $reply_ids ? rows_by_ids('replies', $reply_ids, 'id,body,created_at,user_id,ip_location') : [];
+            $reply_cols = ip_location_ready() ? 'id,body,created_at,user_id,ip_location' : 'id,body,created_at,user_id';
+            $reply_map = $reply_ids ? rows_by_ids('replies', $reply_ids, $reply_cols) : [];
             $reply_uids = array_values(array_unique(array_filter(array_map(fn($x) => (int)($x['user_id'] ?? 0), array_values($reply_map)))));
             $reply_users = $reply_uids ? rows_by_ids('users', $reply_uids, 'id,username,avatar_style,avatar_seed') : [];
             foreach ($rows as &$tt) {
@@ -2668,7 +2715,19 @@ function admin_page(): void
         $security_fields .= $group_select . textarea('保留用户名', 'reserved_usernames', $s['reserved_usernames']);
         $security_fields .= input('1小时内注册限制', 'register_per_hour', $s['register_per_hour'], 'number', true) . input('1小时内登录错误限制', 'login_fail_per_hour', $s['login_fail_per_hour'], 'number', true) . input('1小时内操作错误限制', 'reset_fail_per_hour', $s['reset_fail_per_hour'], 'number', true);
         $security_fields .= captcha_charset_options((string)$s['captcha_charset']) . captcha_forms_options_html((string)$s['captcha_forms']) . '<label class="grid settings-interval-field"><span>发帖/回复间隔（秒）<small>发帖/回复间隔设置为 0 可关闭限制，默认 5 秒一次。</small></span><input name="post_interval_seconds" type="number" value="' . h($s['post_interval_seconds']) . '" required></label>';
-        $html .= '<div class="form-panel settings-form"><form method="post">' . form_token() . input('网站名', 'site_name', $s['site_name'], 'text', true) . input('关键字', 'site_keywords', $s['site_keywords']) . textarea('网站介绍', 'site_description', $s['site_description']) . input('系统发件邮箱', 'mail_from', $s['mail_from'], 'email') . input('置顶主题ID', 'pinned_topic_ids', $s['pinned_topic_ids']) . textarea('页头HTML代码', 'header_html', $s['header_html']) . textarea('页脚HTML代码', 'footer_html', $s['footer_html']) . input('列表单页数量', 'topics_per_page', $s['topics_per_page'], 'number', true) . input('回帖单页数量', 'replies_per_page', $s['replies_per_page'], 'number', true) . '<label class="grid"><span>是否虚拟发送邮件</span><input type="checkbox" name="mail_virtual" value="1"' . ((int)$s['mail_virtual'] ? ' checked' : '') . '></label><label class="grid"><span>是否关闭</span><input type="checkbox" name="site_closed" value="1"' . ((int)$s['site_closed'] ? ' checked' : '') . '></label><label class="grid"><span>启用伪静态</span><input type="checkbox" name="pretty_url" value="1"' . ((int)$s['pretty_url'] ? ' checked' : '') . '></label><h3>安全设置</h3>' . $security_fields . '<div class="row settings-actions"><button type="submit">保存</button></div><div class="settings-opcache-box"><div class="settings-opcache-sep"></div><a href="' . h(admin_url(['tab' => 'settings', 'clear_opcache' => 1])) . '" class="settings-opcache-title">清理OPcache</a><div class="settings-opcache-sub">刷新已编译脚本缓存，适合代码更新后手动触发。</div></div></form></div>';
+        // IP 归属地设置区块
+        $ip_g = ip_location_granularity();
+        $ip_gran_cur = in_array((string)$s['ip_location_granularity'], ['province', 'city', 'area'], true) ? (string)$s['ip_location_granularity'] : 'province';
+        $ip_gran_opts = '';
+        foreach (['province' => '省（中国|北京）', 'city' => '市（中国|北京|北京）', 'area' => '区（中国|北京|北京|大兴）'] as $gv => $gl) $ip_gran_opts .= '<option value="' . h($gv) . '"' . ($ip_gran_cur === $gv ? ' selected' : '') . '>' . h($gl) . '</option>';
+        $ip_test_opts = '';
+        foreach (['province' => '省', 'city' => '市', 'area' => '区'] as $gv => $gl) $ip_test_opts .= '<option value="' . h($gv) . '"' . ($ip_g === $gv ? ' selected' : '') . '>' . h($gl) . '</option>';
+        $ip_location_fields = '<label class="grid"><span>启用 IP 归属地<small>开启后展示并记录发帖/回帖/登录归属地。</small></span><input type="checkbox" name="ip_location_enabled" value="1"' . ((int)$s['ip_location_enabled'] ? ' checked' : '') . '></label>';
+        $ip_location_fields .= '<label class="grid"><span>归属地颗粒度</span><select name="ip_location_granularity">' . $ip_gran_opts . '</select></label>';
+        $ip_location_fields .= input('归属地 API 地址', 'ip_location_api_base', $s['ip_location_api_base'] !== '' ? $s['ip_location_api_base'] : 'http://81.70.36.26:18184');
+        $ip_location_fields .= '<div class="ip-location-test"><label class="grid"><span>测试查询<small>不依赖上面的「启用」开关，可直接测试接口。</small></span></label><div class="ip-location-test-row"><input id="ip_location_test_ip" type="text" value="221.221.52.203" placeholder="输入 IPv4/IPv6"><select id="ip_location_test_g">' . $ip_test_opts . '</select><button type="button" id="ip_location_test_btn">测试</button></div><div id="ip_location_test_result" class="ip-location-test-result" data-empty="1">点击「测试」查看归属地接口返回结果</div></div>';
+        $html .= '<div class="form-panel settings-form"><form method="post">' . form_token() . input('网站名', 'site_name', $s['site_name'], 'text', true) . input('关键字', 'site_keywords', $s['site_keywords']) . textarea('网站介绍', 'site_description', $s['site_description']) . input('系统发件邮箱', 'mail_from', $s['mail_from'], 'email') . input('置顶主题ID', 'pinned_topic_ids', $s['pinned_topic_ids']) . textarea('页头HTML代码', 'header_html', $s['header_html']) . textarea('页脚HTML代码', 'footer_html', $s['footer_html']) . input('列表单页数量', 'topics_per_page', $s['topics_per_page'], 'number', true) . input('回帖单页数量', 'replies_per_page', $s['replies_per_page'], 'number', true) . '<label class="grid"><span>是否虚拟发送邮件</span><input type="checkbox" name="mail_virtual" value="1"' . ((int)$s['mail_virtual'] ? ' checked' : '') . '></label><label class="grid"><span>是否关闭</span><input type="checkbox" name="site_closed" value="1"' . ((int)$s['site_closed'] ? ' checked' : '') . '></label><label class="grid"><span>启用伪静态</span><input type="checkbox" name="pretty_url" value="1"' . ((int)$s['pretty_url'] ? ' checked' : '') . '></label><h3>安全设置</h3>' . $security_fields . '<h3>IP 归属地</h3>' . $ip_location_fields . '<div class="row settings-actions"><button type="submit">保存</button></div><div class="settings-opcache-box"><div class="settings-opcache-sep"></div><a href="' . h(admin_url(['tab' => 'settings', 'clear_opcache' => 1])) . '" class="settings-opcache-title">清理OPcache</a><div class="settings-opcache-sub">刷新已编译脚本缓存，适合代码更新后手动触发。</div></div></form></div>';
+        $html .= '<script>(function(){var btn=document.getElementById("ip_location_test_btn");if(!btn)return;var ipEl=document.getElementById("ip_location_test_ip");var gEl=document.getElementById("ip_location_test_g");var resEl=document.getElementById("ip_location_test_result");btn.addEventListener("click",function(){var ip=(ipEl&&ipEl.value||"").trim();var g=(gEl&&gEl.value||"province");if(!ip){resEl.textContent="请输入IP";resEl.setAttribute("data-empty","1");return;}resEl.textContent="查询中...";resEl.setAttribute("data-empty","0");var u="?a=ip_location_test&ip="+encodeURIComponent(ip)+"&granularity="+encodeURIComponent(g);fetch(u).then(function(r){return r.json();}).then(function(d){if(d&&d.ok){resEl.textContent="原始结果："+(d.result||"(空)");resEl.setAttribute("data-empty","0");}else{resEl.textContent="查询失败："+(d&&d.message||"未知错误");resEl.setAttribute("data-empty","1");}}).catch(function(e){resEl.textContent="请求失败："+e;resEl.setAttribute("data-empty","1");});});})();</script>';
     } elseif ($tab === 'users') {
         $total = admin_count('users', $q, 'title', $user_group_id, $user_banned_filter, $user_muted_filter);
         if ($manageable) $html .= admin_bulk_delete_form_open('users', $q);
@@ -2764,6 +2823,7 @@ try {
     elseif ($a === 'search') search_page();
     elseif ($a === 'form_error') form_error_page();
     elseif ($a === 'captcha_image') captcha_image_page();
+    elseif ($a === 'ip_location_test') ip_location_test_page();
     elseif ($a === 'login') login_page();
     elseif ($a === 'register') register_page();
     elseif ($a === 'forgot_password') forgot_password_page();
