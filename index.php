@@ -1693,7 +1693,6 @@ function topic_reply_list_row(array $t): string
     $meta = '<span>' . $user_link . ' 回复了</span>' . $title_link
           . '<span class="post-forum-meta">' . svg_icon('forum') . $forum_link . '</span>'
           . '<span>' . svg_icon('reply') . (int)$t['reply_count'] . '</span>'
-          . ip_location_meta_html((string)$t['last_reply_ip_location'])
           . '<span>' . human_time((int)$t['last_reply_created_at']) . '</span>';
     $pinned = (int)($t['is_pinned'] ?? 0);
     $badges = $pinned ? '<span class="topic-badge pinned">置顶</span>' : '';
@@ -2835,5 +2834,6 @@ try {
     }
     else not_found('你访问的页面不存在');
 } catch (Throwable $e) {
+    @file_put_contents(__DIR__ . '/log/php_errors.log', '[' . date('Y-m-d H:i:s') . '] ' . $e->getMessage() . ' @ ' . basename($e->getFile()) . ':' . $e->getLine() . "\n" . $e->getTraceAsString() . "\n\n", FILE_APPEND);
     err('操作失败');
 }
