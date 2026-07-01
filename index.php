@@ -2857,5 +2857,6 @@ try {
     }
     else not_found('你访问的页面不存在');
 } catch (Throwable $e) {
+    var_dump($e);
     err('操作失败');
 }

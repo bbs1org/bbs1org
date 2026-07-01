@@ -144,7 +144,17 @@ function i_result(string $title, string $admin_user, string $admin_pass, string 
 }
 function i_locked(): void
 {
-    i_html('安装已锁定', '<div class="hero"><h1>安装已锁定</h1><p>安装入口当前不可访问。</p></div><div class="card"><div class="bd"><div class="note warn">如需重新安装，请先删除安装锁文件后再访问。</div><div style="height:14px"></div><div class="actions"><a class="btn" href="index.php">进入首页</a></div></div></div>');
+    i_html('安装已锁定', '<div class="hero"><h1>安装已锁定</h1><p>站点已安装，且所有迁移均已执行，无需安装或升级。</p></div><div class="card"><div class="bd"><div class="note ok">当前已是最新状态。如需重新安装，请先删除安装锁文件 <span class="mono">data/install.lock</span> 后再访问。</div><div style="height:14px"></div><div class="actions"><a class="btn" href="index.php">进入首页</a></div></div></div>');
+}
+
+/** 升级场景引导页：install.lock 已存在，但检测到有待执行的迁移（锁不一致）。
+ *  此时全量安装入口仍保持锁定，仅引导用户前往迁移管理执行增量迁移。 */
+function i_upgrade_available(array $pending): void
+{
+    $items = '';
+    foreach ($pending as $name) $items .= '<li class="mono">' . i_h($name) . '</li>';
+    $count = count($pending);
+    i_html('发现待执行的迁移', '<div class="hero"><h1>发现待执行的数据库迁移</h1><p>站点已安装（install.lock 存在），检测到有未执行的迁移脚本，属于升级场景。</p></div><div class="grid"><section class="card"><div class="hd"><h2>待执行迁移（' . (string)$count . '）</h2></div><div class="bd"><div class="note warn">当前为<strong>增量升级</strong>：全量安装入口已锁定，不会重复安装或清理数据，仅可执行下方迁移。</div><div style="height:14px"></div><ul class="list">' . $items . '</ul><div style="height:14px"></div><div class="actions"><a class="btn" href="install.php?do=migrations">前往迁移管理执行</a><a class="btn alt" href="index.php">进入首页</a></div></div></section><aside class="card"><div class="hd"><h2>说明</h2></div><div class="bd"><ul class="list"><li><span class="mono">install.lock</span> 已存在：全量安装已被禁止</li><li>存在缺少 <span class="mono">.lock</span> 的迁移：判定为增量升级</li><li>所有迁移执行完成、锁文件齐全后，本页将恢复为「已锁定」</li><li>迁移会直接修改数据库结构，执行前请备份 <span class="mono">data/</span> 目录</li></ul></div></aside></div>');
 }
 function i_form(string $site_name, string $admin_user, string $admin_email, string $admin_pass, string $default_forum, string $topic_title): void
 {
@@ -178,6 +188,17 @@ function i_migration_pending(): array
         $out[] = ['name' => $name, 'locked' => is_file(INSTALL_DATA_DIR . '/' . $name . '.lock')];
     }
     return $out;
+}
+
+/** 返回待执行迁移的 basename 列表（按名升序）：迁移文件存在但缺少对应 .lock。
+ *  用于区分「全量安装已锁定」与「已安装但有增量迁移待执行（升级场景）」。 */
+function i_pending_migrations(): array
+{
+    $pending = [];
+    foreach (i_migration_files() as $name) {
+        if (!is_file(INSTALL_DATA_DIR . '/' . $name . '.lock')) $pending[] = $name;
+    }
+    return $pending;
 }
 
 /** 校验迁移文件名白名单并返回其在 migrate 目录内的绝对路径；非法或不在目录内返回 null。 */
@@ -292,7 +313,11 @@ if ($do === 'migration_run') i_migration_run();   // 内部 exit
 if ($do === 'migrations') i_migrations_page();    // 内部 exit
 
 if (is_file(INSTALL_LOCK_FILE)) {
-    i_locked();
+    // 区分全量安装与升级：install.lock 存在时，需对比所有迁移锁是否一致。
+    // 存在缺少 .lock 的迁移 → 升级场景（引导执行迁移）；锁完全一致 → 全量锁定。
+    $pending = i_pending_migrations();
+    if ($pending) i_upgrade_available($pending);   // 内部 exit
+    i_locked();                                    // 内部 exit：所有锁一致，已是最新
 }
 $step = (string)($_POST['step'] ?? '');
 if ($step !== 'install') {
